@@ -22,7 +22,7 @@ db.exec(`
   );
 `);
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Token");
@@ -72,14 +72,126 @@ app.delete("/api/clear", requireToken, (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Page /sync ─────────────────────────────────────────────────────────────
-// Le bookmarklet ouvre cette page dans un nouvel onglet (window.open).
-// Elle communique avec sekai.one via postMessage pour lire/écrire le localStorage
-// sans jamais y accéder directement, ce qui contourne la restriction Safari iOS.
+// ── POST /api/save-raw : reçoit les données encodées en base64 depuis l'URL ──
+// Utilisé par le bookmarklet iPhone qui ne peut pas faire de fetch cross-origin
+app.get("/api/save-raw", requireToken, (req, res) => {
+  try {
+    const raw = req.query.d;
+    if (!raw) return res.status(400).send("Données manquantes");
+    const data = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+    const upsert = db.prepare(`
+      INSERT INTO progress (token, key, value, ts) VALUES (?, ?, ?, ?)
+      ON CONFLICT(token, key) DO UPDATE SET value=excluded.value, ts=excluded.ts
+    `);
+    const insert = db.transaction((entries) => {
+      for (const [key, value] of entries) upsert.run(req.token, key, String(value), Date.now());
+    });
+    insert(Object.entries(data));
+    // Redirige vers la page de succès
+    res.redirect(`/done?ok=1&n=${Object.keys(data).length}&action=save`);
+  } catch(e) {
+    res.redirect(`/done?ok=0&msg=${encodeURIComponent(e.message)}&action=save`);
+  }
+});
+
+// ── GET /sync : page de restauration (charge les données et injecte dans sekai.one) ──
 app.get("/sync", requireToken, (req, res) => {
-  const action = req.query.action || "save";
   const token = req.query.token;
   const serverUrl = `${req.protocol}://${req.get("host")}`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sekai Sync - Restauration</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;text-align:center}
+.card{background:#13132a;border:1px solid #ffffff18;border-radius:16px;padding:32px 28px;max-width:340px;width:100%}
+.icon{font-size:40px;margin-bottom:14px}
+h1{font-size:19px;font-weight:600;margin-bottom:6px;color:#e2b96f}
+p{font-size:13px;color:#8888bb;margin-bottom:14px;line-height:1.5}
+.st{font-size:13px;padding:10px 14px;border-radius:8px;margin-top:10px}
+.st.ok{background:#0f2d1f;color:#6be09a;border:1px solid #2a6644}
+.st.err{background:#2d0f0f;color:#e06b6b;border:1px solid #662a2a}
+.st.loading{background:#1c1c38;color:#8888bb;border:1px solid #333366}
+button{width:100%;padding:11px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:10px;background:#7b5ea7;color:#fff}
+.bm{background:#1c1c38;border:1px solid #333;border-radius:8px;padding:10px;font-family:monospace;font-size:9px;color:#999;word-break:break-all;margin-top:10px;text-align:left;line-height:1.4;max-height:80px;overflow-y:auto;user-select:all;cursor:pointer}
+.hint{font-size:11px;color:#6666aa;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">&#x26E9;&#xFE0F;</div>
+  <h1>Sekai Sync</h1>
+  <p>Restauration de ta progression sur Sekai.one</p>
+  <div class="st loading" id="st">Chargement depuis le serveur...</div>
+  <div id="extra"></div>
+  <button id="btn" style="display:none" onclick="window.close()">Fermer</button>
+</div>
+<script>
+var SRV='${serverUrl}',TK='${token}';
+var st=document.getElementById('st'),btn=document.getElementById('btn'),extra=document.getElementById('extra');
+function done(ok,msg){st.className='st '+(ok?'ok':'err');st.textContent=msg;btn.style.display='block';}
+
+fetch(SRV+'/api/load',{headers:{'X-Token':TK}})
+  .then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  })
+  .then(function(j){
+    var entries=Object.entries(j.data);
+    if(entries.length===0){done(true,'Aucune donnee sauvegardee sur le serveur.');return;}
+    
+    // Encode les données dans un bookmarklet d'injection
+    // Ce bookmarklet va s'exécuter sur sekai.one et injecter directement les données
+    var pairs=[];
+    for(var i=0;i<entries.length;i++){
+      var k=entries[i][0],v=entries[i][1].value;
+      pairs.push([JSON.stringify(k),JSON.stringify(v)]);
+    }
+    var lines=pairs.map(function(p){return 'localStorage.setItem('+p[0]+','+p[1]+');'});
+    var code='void function(){'+lines.join('')+'alert("Sekai Sync : '+entries.length+' cle(s) restauree(s) !");}();';
+    var bm='javascript:'+encodeURIComponent(code);
+    
+    st.className='st ok';
+    st.textContent=''+entries.length+' cle(s) chargee(s) ! Etape suivante :';
+    
+    extra.innerHTML='<p style="color:#d4d4f0;font-size:12px;margin-top:10px">1. Retourne sur Sekai.one<br>2. Appuie sur le favori <strong>Sekai Restore</strong> ci-dessous</p>'
+      +'<div class="bm" id="bm-code" onclick="copyBm()">'+escHtml(bm)+'</div>'
+      +'<div class="hint">Appuie pour copier, puis colle dans un favori Safari</div>';
+    btn.style.display='block';
+    
+    // Tente aussi via window.opener si disponible
+    if(window.opener && !window.opener.closed){
+      try{
+        window.opener.postMessage({sekaiSync:'restore',data:j.data},'https://sekai.one');
+        st.textContent='Restauration envoyee directement a Sekai.one !';
+        extra.innerHTML='';
+      }catch(e){}
+    }
+  })
+  .catch(function(e){done(false,'Erreur : '+e.message);});
+
+function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function copyBm(){
+  var el=document.getElementById('bm-code');
+  if(navigator.clipboard){navigator.clipboard.writeText(el.textContent).then(function(){alert('Code copie !');});}
+  else{var r=document.createRange();r.selectNode(el);window.getSelection().removeAllRanges();window.getSelection().addRange(r);document.execCommand('copy');alert('Code copie !');}
+}
+</script>
+</body>
+</html>`);
+});
+
+// ── GET /done : page de confirmation après sauvegarde ──────────────────────
+app.get("/done", (req, res) => {
+  const ok = req.query.ok === "1";
+  const n = req.query.n || "0";
+  const msg = req.query.msg || "";
+  const action = req.query.action || "save";
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
@@ -90,69 +202,27 @@ app.get("/sync", requireToken, (req, res) => {
 <title>Sekai Sync</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:20px;text-align:center}
+body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;text-align:center}
 .card{background:#13132a;border:1px solid #ffffff18;border-radius:16px;padding:32px 28px;max-width:340px;width:100%}
-.icon{font-size:48px;margin-bottom:16px}
-h1{font-size:20px;font-weight:600;margin-bottom:8px;color:#e2b96f}
-p{font-size:14px;color:#8888bb;line-height:1.6;margin-bottom:16px}
-.status{font-size:13px;padding:10px 16px;border-radius:8px;margin-top:12px}
-.status.ok{background:#0f2d1f;color:#6be09a;border:1px solid #2a6644}
-.status.err{background:#2d0f0f;color:#e06b6b;border:1px solid #662a2a}
-.status.loading{background:#1c1c38;color:#8888bb;border:1px solid #333366}
-button{width:100%;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px;background:#7b5ea7;color:#fff}
+.icon{font-size:40px;margin-bottom:14px}
+h1{font-size:19px;font-weight:600;margin-bottom:6px;color:#e2b96f}
+.st{font-size:14px;padding:12px 16px;border-radius:8px;margin-top:12px}
+.st.ok{background:#0f2d1f;color:#6be09a;border:1px solid #2a6644}
+.st.err{background:#2d0f0f;color:#e06b6b;border:1px solid #662a2a}
+button{width:100%;padding:11px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px;background:#7b5ea7;color:#fff}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="icon">&#x26E9;&#xFE0F;</div>
+  <div class="icon">${ok ? "✅" : "❌"}</div>
   <h1>Sekai Sync</h1>
-  <p>${action === "save" ? "Sauvegarde de ta progression..." : "Restauration de ta progression..."}</p>
-  <div class="status loading" id="st">Connexion a Sekai.one...</div>
-  <button id="btn" style="display:none" onclick="window.close()">Fermer</button>
+  <div class="st ${ok ? "ok" : "err"}">
+    ${ok
+      ? (action === "save" ? `Sauvegarde OK — ${n} cle(s) enregistree(s) !` : `Restauration OK !`)
+      : `Erreur : ${msg}`}
+  </div>
+  <button onclick="window.close()">Fermer</button>
 </div>
-<script>
-var SRV='${serverUrl}',TK='${token}',ACT='${action}';
-var st=document.getElementById('st'),btn=document.getElementById('btn');
-function done(ok,msg){st.className='status '+(ok?'ok':'err');st.textContent=msg;btn.style.display='block';}
-function save(data){
-  fetch(SRV+'/api/save',{method:'POST',headers:{'Content-Type':'application/json','X-Token':TK},body:JSON.stringify({data:data})})
-  .then(function(r){return r.json();})
-  .then(function(){done(true,'Sauvegarde OK ! '+Object.keys(data).length+' cle(s)');})
-  .catch(function(e){done(false,'Erreur : '+e.message);});
-}
-function load(){
-  fetch(SRV+'/api/load',{headers:{'X-Token':TK}})
-  .then(function(r){return r.json();})
-  .then(function(j){
-    if(window.opener){
-      window.opener.postMessage({sekaiSync:'restore',data:j.data},'https://sekai.one');
-      done(true,'Restauration envoyee a Sekai.one !');
-    } else {
-      done(false,'Garde Sekai.one ouvert en arriere-plan.');
-    }
-  })
-  .catch(function(e){done(false,'Erreur : '+e.message);});
-}
-if(ACT==='save'){
-  if(window.opener){
-    st.textContent='Lecture localStorage...';
-    window.addEventListener('message',function h(e){
-      if(e.origin!=='https://sekai.one')return;
-      if(e.data&&e.data.sekaiSync==='data'){
-        window.removeEventListener('message',h);
-        st.textContent='Envoi au serveur...';
-        save(e.data.payload);
-      }
-    });
-    window.opener.postMessage({sekaiSync:'get'},'https://sekai.one');
-    setTimeout(function(){if(st.className.indexOf('loading')>-1){done(false,'Sekai.one ne repond pas. Recharge la page Sekai puis reessaie.');}},5000);
-  } else {
-    done(false,'Garde Sekai.one ouvert avant de taper sur le favori.');
-  }
-} else {
-  load();
-}
-</script>
 </body>
 </html>`);
 });
