@@ -72,13 +72,15 @@ app.delete("/api/clear", requireToken, (req, res) => {
   res.json({ ok: true });
 });
 
-// ── POST /api/save-raw : reçoit les données encodées en base64 depuis l'URL ──
-// Utilisé par le bookmarklet iPhone qui ne peut pas faire de fetch cross-origin
+// ── GET /api/save-raw : sauvegarde via URL (pour bookmarklet iPhone) ───────
 app.get("/api/save-raw", requireToken, (req, res) => {
   try {
     const raw = req.query.d;
-    if (!raw) return res.status(400).send("Données manquantes");
-    const data = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+    if (!raw) return res.status(400).send("Donnees manquantes");
+    // Décode base64url → JSON
+    const padded = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const decoded = Buffer.from(padded, 'base64').toString('utf8');
+    const data = JSON.parse(decoded);
     const upsert = db.prepare(`
       INSERT INTO progress (token, key, value, ts) VALUES (?, ?, ?, ?)
       ON CONFLICT(token, key) DO UPDATE SET value=excluded.value, ts=excluded.ts
@@ -87,17 +89,39 @@ app.get("/api/save-raw", requireToken, (req, res) => {
       for (const [key, value] of entries) upsert.run(req.token, key, String(value), Date.now());
     });
     insert(Object.entries(data));
-    // Redirige vers la page de succès
-    res.redirect(`/done?ok=1&n=${Object.keys(data).length}&action=save`);
+    // Filtre les cookies de progression pour l'affichage
+    const progressKeys = Object.keys(data).filter(k => /Time$|Num$|ID$|Duration$|Titre$/.test(k));
+    res.redirect(`/done?ok=1&n=${Object.keys(data).length}&prog=${progressKeys.length}`);
   } catch(e) {
-    res.redirect(`/done?ok=0&msg=${encodeURIComponent(e.message)}&action=save`);
+    res.redirect(`/done?ok=0&msg=${encodeURIComponent(e.message)}`);
   }
 });
 
-// ── GET /sync : page de restauration (charge les données et injecte dans sekai.one) ──
+// ── GET /sync : page de restauration iPhone ────────────────────────────────
 app.get("/sync", requireToken, (req, res) => {
   const token = req.query.token;
   const serverUrl = `${req.protocol}://${req.get("host")}`;
+  const rows = db.prepare("SELECT key, value FROM progress WHERE token = ?").all(req.token);
+
+  if (rows.length === 0) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sekai Sync</title>
+    <style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;text-align:center}
+    .card{background:#13132a;border:1px solid #fff2;border-radius:16px;padding:28px;max-width:340px;width:100%}h1{color:#e2b96f;font-size:18px;margin:12px 0 8px}p{color:#8888bb;font-size:13px}
+    button{width:100%;padding:11px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:14px;background:#7b5ea7;color:#fff}</style></head>
+    <body><div class="card"><div style="font-size:40px">⛩️</div><h1>Sekai Sync</h1>
+    <p>Aucune donnée sauvegardée sur le serveur.<br><br>Sauvegarde d'abord depuis un épisode sur PC.</p>
+    <button onclick="history.back()">Retour</button></div></body></html>`);
+  }
+
+  // Génère le bookmarklet d'injection de cookies
+  const cookiePairs = rows.map(r => {
+    return `document.cookie=${JSON.stringify(r.key + '=' + encodeURIComponent(r.value) + '; expires=' + new Date(Date.now()+365*864e5).toUTCString() + '; path=/; SameSite=Lax')};`;
+  }).join('');
+
+  const bmCode = 'void function(){' + cookiePairs + 'alert("Sekai Sync : ' + rows.length + ' cookies restaures ! La page va se recharger.");location.reload();}();';
+  const bmUrl = 'javascript:' + encodeURIComponent(bmCode);
+
+  const progressRows = rows.filter(r => /Time$|Num$|ID$|Duration$|Titre$/.test(r.key));
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
@@ -105,126 +129,90 @@ app.get("/sync", requireToken, (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sekai Sync - Restauration</title>
+<title>Sekai Sync - Restaurer</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;text-align:center}
-.card{background:#13132a;border:1px solid #ffffff18;border-radius:16px;padding:32px 28px;max-width:340px;width:100%}
-.icon{font-size:40px;margin-bottom:14px}
-h1{font-size:19px;font-weight:600;margin-bottom:6px;color:#e2b96f}
-p{font-size:13px;color:#8888bb;margin-bottom:14px;line-height:1.5}
-.st{font-size:13px;padding:10px 14px;border-radius:8px;margin-top:10px}
-.st.ok{background:#0f2d1f;color:#6be09a;border:1px solid #2a6644}
-.st.err{background:#2d0f0f;color:#e06b6b;border:1px solid #662a2a}
-.st.loading{background:#1c1c38;color:#8888bb;border:1px solid #333366}
-button{width:100%;padding:11px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:10px;background:#7b5ea7;color:#fff}
-.bm{background:#1c1c38;border:1px solid #333;border-radius:8px;padding:10px;font-family:monospace;font-size:9px;color:#999;word-break:break-all;margin-top:10px;text-align:left;line-height:1.4;max-height:80px;overflow-y:auto;user-select:all;cursor:pointer}
-.hint{font-size:11px;color:#6666aa;margin-top:8px}
+body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;padding:20px}
+h1{color:#e2b96f;font-size:18px;margin:14px 0 6px;text-align:center}
+.icon{text-align:center;font-size:36px;margin-top:10px}
+.card{background:#13132a;border:1px solid #fff2;border-radius:12px;padding:16px;margin:14px 0}
+.label{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#6666aa;margin-bottom:8px}
+.prog-row{display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px solid #ffffff08}
+.prog-key{color:#e2b96f}
+.prog-val{color:#d4d4f0;font-family:monospace}
+.bm-box{background:#0d0d1a;border:1px solid #333;border-radius:8px;padding:10px;font-family:monospace;font-size:9px;color:#888;word-break:break-all;line-height:1.5;max-height:72px;overflow-y:auto;user-select:all;cursor:pointer;margin:10px 0}
+.steps{font-size:12px;color:#8888bb;line-height:1.8}
+.steps b{color:#d4d4f0}
+button{width:100%;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:8px}
+.btn-copy{background:#7b5ea7;color:#fff}
+.btn-back{background:#1c1c38;color:#8888bb;margin-top:6px}
+.hint{font-size:11px;color:#6666aa;text-align:center;margin-top:6px}
 </style>
 </head>
 <body>
+<div class="icon">⛩️</div>
+<h1>Sekai Sync</h1>
+
+${progressRows.length > 0 ? `
 <div class="card">
-  <div class="icon">&#x26E9;&#xFE0F;</div>
-  <h1>Sekai Sync</h1>
-  <p>Restauration de ta progression sur Sekai.one</p>
-  <div class="st loading" id="st">Chargement depuis le serveur...</div>
-  <div id="extra"></div>
-  <button id="btn" style="display:none" onclick="window.close()">Fermer</button>
+  <div class="label">Progression sauvegardée (${progressRows.length} entrées)</div>
+  ${progressRows.map(r => `<div class="prog-row"><span class="prog-key">${r.key}</span><span class="prog-val">${r.value.substring(0,20)}</span></div>`).join('')}
+</div>` : ''}
+
+<div class="card">
+  <div class="label">Comment restaurer sur iPhone</div>
+  <div class="steps">
+    <b>1.</b> Copie le code ci-dessous<br>
+    <b>2.</b> Crée un favori Safari avec ce code comme URL<br>
+    <b>3.</b> Va sur <b>sekai.one</b><br>
+    <b>4.</b> Appuie sur ce favori → la page se rechargera
+  </div>
+  <div class="bm-box" id="bm" onclick="copyCode()">${bmUrl.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+  <div class="hint">Appuie sur le code pour copier</div>
+  <button class="btn-copy" onclick="copyCode()">📋 Copier le code de restauration</button>
+  <button class="btn-back" onclick="history.back()">← Retour</button>
 </div>
+
 <script>
-var SRV='${serverUrl}',TK='${token}';
-var st=document.getElementById('st'),btn=document.getElementById('btn'),extra=document.getElementById('extra');
-function done(ok,msg){st.className='st '+(ok?'ok':'err');st.textContent=msg;btn.style.display='block';}
-
-fetch(SRV+'/api/load',{headers:{'X-Token':TK}})
-  .then(function(r){
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return r.json();
-  })
-  .then(function(j){
-    var entries=Object.entries(j.data);
-    if(entries.length===0){done(true,'Aucune donnee sauvegardee sur le serveur.');return;}
-    
-    // Encode les données dans un bookmarklet d'injection
-    // Ce bookmarklet va s'exécuter sur sekai.one et injecter directement les données
-    var pairs=[];
-    for(var i=0;i<entries.length;i++){
-      var k=entries[i][0],v=entries[i][1].value;
-      pairs.push([JSON.stringify(k),JSON.stringify(v)]);
-    }
-    var lines=pairs.map(function(p){return 'localStorage.setItem('+p[0]+','+p[1]+');'});
-    var code='void function(){'+lines.join('')+'alert("Sekai Sync : '+entries.length+' cle(s) restauree(s) !");}();';
-    var bm='javascript:'+encodeURIComponent(code);
-    
-    st.className='st ok';
-    st.textContent=''+entries.length+' cle(s) chargee(s) ! Etape suivante :';
-    
-    extra.innerHTML='<p style="color:#d4d4f0;font-size:12px;margin-top:10px">1. Retourne sur Sekai.one<br>2. Appuie sur le favori <strong>Sekai Restore</strong> ci-dessous</p>'
-      +'<div class="bm" id="bm-code" onclick="copyBm()">'+escHtml(bm)+'</div>'
-      +'<div class="hint">Appuie pour copier, puis colle dans un favori Safari</div>';
-    btn.style.display='block';
-    
-    // Tente aussi via window.opener si disponible
-    if(window.opener && !window.opener.closed){
-      try{
-        window.opener.postMessage({sekaiSync:'restore',data:j.data},'https://sekai.one');
-        st.textContent='Restauration envoyee directement a Sekai.one !';
-        extra.innerHTML='';
-      }catch(e){}
-    }
-  })
-  .catch(function(e){done(false,'Erreur : '+e.message);});
-
-function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function copyBm(){
-  var el=document.getElementById('bm-code');
-  if(navigator.clipboard){navigator.clipboard.writeText(el.textContent).then(function(){alert('Code copie !');});}
-  else{var r=document.createRange();r.selectNode(el);window.getSelection().removeAllRanges();window.getSelection().addRange(r);document.execCommand('copy');alert('Code copie !');}
+function copyCode(){
+  var txt=document.getElementById('bm').textContent;
+  if(navigator.clipboard){
+    navigator.clipboard.writeText(txt).then(function(){alert('Code copié !');});
+  } else {
+    var r=document.createRange();r.selectNode(document.getElementById('bm'));
+    window.getSelection().removeAllRanges();window.getSelection().addRange(r);
+    document.execCommand('copy');alert('Code copié !');
+  }
 }
 </script>
 </body>
 </html>`);
 });
 
-// ── GET /done : page de confirmation après sauvegarde ──────────────────────
+// ── GET /done : confirmation après sauvegarde iPhone ──────────────────────
 app.get("/done", (req, res) => {
   const ok = req.query.ok === "1";
-  const n = req.query.n || "0";
+  const n = parseInt(req.query.n || "0");
+  const prog = parseInt(req.query.prog || "0");
   const msg = req.query.msg || "";
-  const action = req.query.action || "save";
-
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sekai Sync</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;text-align:center}
-.card{background:#13132a;border:1px solid #ffffff18;border-radius:16px;padding:32px 28px;max-width:340px;width:100%}
-.icon{font-size:40px;margin-bottom:14px}
-h1{font-size:19px;font-weight:600;margin-bottom:6px;color:#e2b96f}
-.st{font-size:14px;padding:12px 16px;border-radius:8px;margin-top:12px}
-.st.ok{background:#0f2d1f;color:#6be09a;border:1px solid #2a6644}
-.st.err{background:#2d0f0f;color:#e06b6b;border:1px solid #662a2a}
-button{width:100%;padding:11px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px;background:#7b5ea7;color:#fff}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="icon">${ok ? "✅" : "❌"}</div>
-  <h1>Sekai Sync</h1>
-  <div class="st ${ok ? "ok" : "err"}">
-    ${ok
-      ? (action === "save" ? `Sauvegarde OK — ${n} cle(s) enregistree(s) !` : `Restauration OK !`)
-      : `Erreur : ${msg}`}
-  </div>
-  <button onclick="window.close()">Fermer</button>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sekai Sync</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0d0d1a;color:#d4d4f0;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px;text-align:center}
+.card{background:#13132a;border:1px solid #fff2;border-radius:16px;padding:28px;max-width:340px;width:100%}
+.icon{font-size:40px;margin-bottom:12px}h1{color:#e2b96f;font-size:18px;margin-bottom:10px}
+.st{font-size:13px;padding:12px;border-radius:8px;margin-top:10px;line-height:1.6}
+.ok{background:#0f2d1f;color:#6be09a;border:1px solid #2a6644}
+.err{background:#2d0f0f;color:#e06b6b;border:1px solid #662a2a}
+button{width:100%;padding:12px;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px;background:#7b5ea7;color:#fff}</style></head>
+<body><div class="card">
+<div class="icon">${ok ? "✅" : "❌"}</div>
+<h1>Sekai Sync</h1>
+<div class="st ${ok ? "ok" : "err"}">
+${ok ? `Sauvegarde OK !<br>${n} cookies enregistrés<br>${prog > 0 ? `dont <b>${prog} cookies de progression</b>` : '<span style="color:#e2b96f">⚠️ Aucun cookie de progression détecté<br>Sauvegarde depuis un épisode, pas la page d\'accueil</span>'}` : `Erreur : ${msg}`}
 </div>
-</body>
-</html>`);
+<button onclick="history.back()">← Retour sur Sekai</button>
+</div></body></html>`);
 });
 
 app.get("/", (req, res) => res.json({ status: "Sekai Sync API operationnelle" }));
