@@ -1,26 +1,33 @@
 const express = require("express");
-const Database = require("better-sqlite3");
+const { createClient } = require("@libsql/client");
 const crypto = require("crypto");
-const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const db = new Database(path.join(__dirname, "sekai.db"));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS progress (
-    token TEXT NOT NULL,
-    key   TEXT NOT NULL,
-    value TEXT NOT NULL,
-    ts    INTEGER NOT NULL,
-    PRIMARY KEY (token, key),
-    FOREIGN KEY (token) REFERENCES sessions(token)
-  );
-`);
+// ── Connexion Turso (persistante, ne s'efface jamais) ──────────────────────
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
+
+async function initDb() {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS progress (
+      token TEXT NOT NULL,
+      key   TEXT NOT NULL,
+      value TEXT NOT NULL,
+      ts    INTEGER NOT NULL,
+      PRIMARY KEY (token, key)
+    )
+  `);
+}
 
 app.use(express.json({ limit: "2mb" }));
 app.use((req, res, next) => {
@@ -31,77 +38,86 @@ app.use((req, res, next) => {
   next();
 });
 
-function requireToken(req, res, next) {
+async function requireToken(req, res, next) {
   const token = req.headers["x-token"] || req.query.token;
   if (!token) return res.status(401).json({ error: "Token manquant" });
-  const row = db.prepare("SELECT token FROM sessions WHERE token = ?").get(token);
-  if (!row) return res.status(401).json({ error: "Token invalide" });
+  const result = await db.execute({
+    sql: "SELECT token FROM sessions WHERE token = ?",
+    args: [token],
+  });
+  if (result.rows.length === 0) return res.status(401).json({ error: "Token invalide" });
   req.token = token;
   next();
 }
 
-app.post("/api/register", (req, res) => {
+app.post("/api/register", async (req, res) => {
   const token = crypto.randomBytes(24).toString("hex");
-  db.prepare("INSERT INTO sessions (token, created_at) VALUES (?, ?)").run(token, Date.now());
+  await db.execute({
+    sql: "INSERT INTO sessions (token, created_at) VALUES (?, ?)",
+    args: [token, Date.now()],
+  });
   res.json({ token });
 });
 
-app.post("/api/save", requireToken, (req, res) => {
+app.post("/api/save", requireToken, async (req, res) => {
   const { data } = req.body;
   if (!data || typeof data !== "object") return res.status(400).json({ error: "data manquant" });
-  const upsert = db.prepare(`
-    INSERT INTO progress (token, key, value, ts) VALUES (?, ?, ?, ?)
-    ON CONFLICT(token, key) DO UPDATE SET value=excluded.value, ts=excluded.ts
-  `);
-  const insert = db.transaction((entries) => {
-    for (const [key, value] of entries) upsert.run(req.token, key, String(value), Date.now());
-  });
-  insert(Object.entries(data));
-  res.json({ ok: true, saved: Object.keys(data).length });
+  const entries = Object.entries(data);
+  const ts = Date.now();
+  const statements = entries.map(([key, value]) => ({
+    sql: `INSERT INTO progress (token, key, value, ts) VALUES (?, ?, ?, ?)
+          ON CONFLICT(token, key) DO UPDATE SET value=excluded.value, ts=excluded.ts`,
+    args: [req.token, key, String(value), ts],
+  }));
+  if (statements.length > 0) await db.batch(statements, "write");
+  res.json({ ok: true, saved: entries.length });
 });
 
-app.get("/api/load", requireToken, (req, res) => {
-  const rows = db.prepare("SELECT key, value, ts FROM progress WHERE token = ?").all(req.token);
+app.get("/api/load", requireToken, async (req, res) => {
+  const result = await db.execute({
+    sql: "SELECT key, value, ts FROM progress WHERE token = ?",
+    args: [req.token],
+  });
   const data = {};
-  for (const row of rows) data[row.key] = { value: row.value, ts: row.ts };
+  for (const row of result.rows) data[row.key] = { value: row.value, ts: row.ts };
   res.json({ ok: true, data });
 });
 
-app.delete("/api/clear", requireToken, (req, res) => {
-  db.prepare("DELETE FROM progress WHERE token = ?").run(req.token);
+app.delete("/api/clear", requireToken, async (req, res) => {
+  await db.execute({ sql: "DELETE FROM progress WHERE token = ?", args: [req.token] });
   res.json({ ok: true });
 });
 
-// ── GET /api/save-raw : sauvegarde via URL (pour bookmarklet iPhone) ───────
-app.get("/api/save-raw", requireToken, (req, res) => {
+// ── GET /api/save-raw : sauvegarde via URL (bookmarklet iPhone) ───────────
+app.get("/api/save-raw", requireToken, async (req, res) => {
   try {
     const raw = req.query.d;
     if (!raw) return res.status(400).send("Donnees manquantes");
-    // Décode base64url → JSON
     const padded = raw.replace(/-/g, '+').replace(/_/g, '/');
     const decoded = Buffer.from(padded, 'base64').toString('utf8');
     const data = JSON.parse(decoded);
-    const upsert = db.prepare(`
-      INSERT INTO progress (token, key, value, ts) VALUES (?, ?, ?, ?)
-      ON CONFLICT(token, key) DO UPDATE SET value=excluded.value, ts=excluded.ts
-    `);
-    const insert = db.transaction((entries) => {
-      for (const [key, value] of entries) upsert.run(req.token, key, String(value), Date.now());
-    });
-    insert(Object.entries(data));
-    // Filtre les cookies de progression pour l'affichage
+    const entries = Object.entries(data);
+    const ts = Date.now();
+    const statements = entries.map(([key, value]) => ({
+      sql: `INSERT INTO progress (token, key, value, ts) VALUES (?, ?, ?, ?)
+            ON CONFLICT(token, key) DO UPDATE SET value=excluded.value, ts=excluded.ts`,
+      args: [req.token, key, String(value), ts],
+    }));
+    if (statements.length > 0) await db.batch(statements, "write");
     const progressKeys = Object.keys(data).filter(k => /Time$|Num$|ID$|Duration$|Titre$/.test(k));
-    res.redirect(`/done?ok=1&n=${Object.keys(data).length}&prog=${progressKeys.length}`);
+    res.redirect(`/done?ok=1&n=${entries.length}&prog=${progressKeys.length}`);
   } catch(e) {
     res.redirect(`/done?ok=0&msg=${encodeURIComponent(e.message)}`);
   }
 });
 
 // ── GET /sync : page de restauration iPhone ────────────────────────────────
-app.get("/sync", requireToken, (req, res) => {
-  const token = req.query.token;
-  const serverUrl = `${req.protocol}://${req.get("host")}`;
-  const rows = db.prepare("SELECT key, value FROM progress WHERE token = ?").all(req.token);
+app.get("/sync", requireToken, async (req, res) => {
+  const result = await db.execute({
+    sql: "SELECT key, value FROM progress WHERE token = ?",
+    args: [req.token],
+  });
+  const rows = result.rows;
 
   if (rows.length === 0) {
     return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sekai Sync</title>
@@ -113,7 +129,6 @@ app.get("/sync", requireToken, (req, res) => {
     <button onclick="history.back()">Retour</button></div></body></html>`);
   }
 
-  // Génère le bookmarklet d'injection de cookies
   const cookiePairs = rows.map(r => {
     return `document.cookie=${JSON.stringify(r.key + '=' + encodeURIComponent(r.value) + '; expires=' + new Date(Date.now()+365*864e5).toUTCString() + '; path=/; SameSite=Lax')};`;
   }).join('');
@@ -156,7 +171,7 @@ button{width:100%;padding:12px;border:none;border-radius:10px;font-size:14px;fon
 ${progressRows.length > 0 ? `
 <div class="card">
   <div class="label">Progression sauvegardée (${progressRows.length} entrées)</div>
-  ${progressRows.map(r => `<div class="prog-row"><span class="prog-key">${r.key}</span><span class="prog-val">${r.value.substring(0,20)}</span></div>`).join('')}
+  ${progressRows.map(r => `<div class="prog-row"><span class="prog-key">${r.key}</span><span class="prog-val">${String(r.value).substring(0,20)}</span></div>`).join('')}
 </div>` : ''}
 
 <div class="card">
@@ -215,5 +230,13 @@ ${ok ? `Sauvegarde OK !<br>${n} cookies enregistrés<br>${prog > 0 ? `dont <b>${
 </div></body></html>`);
 });
 
-app.get("/", (req, res) => res.json({ status: "Sekai Sync API operationnelle" }));
-app.listen(PORT, () => console.log(`Sekai Sync server sur le port ${PORT}`));
+app.get("/", (req, res) => res.json({ status: "Sekai Sync API operationnelle (Turso)" }));
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log(`Sekai Sync server sur le port ${PORT}`));
+  })
+  .catch((err) => {
+    console.error("Erreur initialisation DB Turso:", err);
+    process.exit(1);
+  });
